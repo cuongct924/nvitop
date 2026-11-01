@@ -19,13 +19,35 @@
 from __future__ import annotations
 
 import math
+import re
 import time
 from typing import Sequence
 
 from prometheus_client import REGISTRY, CollectorRegistry, Gauge, Info
 
-from nvitop import Device, GpuProcess, MiB, MigDevice, PhysicalDevice, host
+from nvitop import NA, Device, GpuProcess, MiB, MigDevice, PhysicalDevice, host
 from nvitop_exporter.utils import get_ip_address
+
+
+_LABEL_NAME_INVALID = re.compile(r'[^a-zA-Z0-9_]')
+_RESERVED_POD_LABELS = {'pod_name', 'pod_namespace', 'container_name', 'node_name'}
+_MAX_POD_LABELS = 32
+_MAX_LABEL_VALUE_LEN = 128
+
+
+def _sanitize_pod_labels(labels: object) -> dict[str, str]:
+    """Turn Kubernetes pod labels into valid Prometheus label names (bounded)."""
+    if not isinstance(labels, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key, value in sorted(labels.items())[:_MAX_POD_LABELS]:
+        name = _LABEL_NAME_INVALID.sub('_', str(key))
+        if not name or name[0].isdigit() or name.startswith('__'):
+            name = f'label_{name.lstrip("_")}'
+        if name in _RESERVED_POD_LABELS:
+            name = f'label_{name}'
+        result[name] = str(value)[:_MAX_LABEL_VALUE_LEN]
+    return result
 
 
 class PrometheusExporter:  # pylint: disable=too-many-instance-attributes
@@ -53,6 +75,14 @@ class PrometheusExporter:  # pylint: disable=too-many-instance-attributes
         self.registry = registry
         self.interval = interval
         self.alive_pids: dict[Device, set[tuple[int, str]]] = {
+            device: set() for device in self.devices
+        }
+        # Kubernetes label values actually used for each alive process / pod, so that dead
+        # series can be removed with the exact same label values (no stale-series leak).
+        self.process_k8s_labels: dict[Device, dict[tuple[int, str], tuple[str, ...]]] = {
+            device: {} for device in self.devices
+        }
+        self.pod_label_keys: dict[Device, set[tuple[str, str, str, str]]] = {
             device: set() for device in self.devices
         }
 
@@ -762,6 +792,7 @@ class PrometheusExporter:  # pylint: disable=too-many-instance-attributes
         alive_pids = self.alive_pids[device]
         previous_alive_pids = alive_pids.copy()
         alive_pids.clear()
+        current_pod_keys: set[tuple[str, str, str, str]] = set()
 
         with GpuProcess.failsafe():
             host_snapshots = {}
@@ -773,22 +804,35 @@ class PrometheusExporter:  # pylint: disable=too-many-instance-attributes
                     else:
                         host_snapshot = host_snapshots[pid, username]
 
-                    # Collect Kubernetes information (always enabled)
+                    # Collect Kubernetes information (never raises; N/A outside Kubernetes)
                     try:
-                        k8s_pod_name = process.pod_name()
-                        k8s_pod_namespace = process.pod_namespace()
-                        k8s_pod_uid = process.pod_uid()
-                        k8s_container_name = process.container_name()
-                        k8s_container_id = process.container_id()
-                        k8s_node_name = process.node_name()
+                        k8s_values = tuple(
+                            str(v)
+                            for v in (
+                                process.pod_name(),
+                                process.pod_namespace(),
+                                process.pod_uid(),
+                                process.container_name(),
+                                process.container_id(),
+                                process.node_name(),
+                            )
+                        )
                         k8s_pod_labels = process.pod_labels()
                         k8s_gpu_requests = process.nvidia_gpu_requests()
                         k8s_gpu_limits = process.nvidia_gpu_limits()
-                    except (ImportError, OSError, AttributeError, KeyError, ValueError):
-                        k8s_pod_name = k8s_pod_namespace = k8s_pod_uid = 'N/A'
-                        k8s_container_name = k8s_container_id = k8s_node_name = 'N/A'
+                    except Exception:  # noqa: BLE001
+                        k8s_values = ('N/A',) * 6
                         k8s_pod_labels = {}
-                        k8s_gpu_requests = k8s_gpu_limits = 0
+                        k8s_gpu_requests = k8s_gpu_limits = NA
+                    (
+                        k8s_pod_name,
+                        k8s_pod_namespace,
+                        k8s_pod_uid,
+                        k8s_container_name,
+                        k8s_container_id,
+                        k8s_node_name,
+                    ) = k8s_values
+                    self.process_k8s_labels[device][pid, username] = k8s_values
 
                     self.process_info.labels(
                         hostname=self.hostname,
@@ -854,41 +898,25 @@ class PrometheusExporter:  # pylint: disable=too-many-instance-attributes
                             node_name=k8s_node_name,
                         ).set(value)
 
-                    # Set Kubernetes-specific metrics
-                    self.process_pod_labels.labels(
-                        pod_name=k8s_pod_name,
-                        pod_namespace=k8s_pod_namespace,
-                        container_name=k8s_container_name,
-                        node_name=k8s_node_name,
-                    ).info(k8s_pod_labels if k8s_pod_labels else {})
-
-                    self.process_nvidia_gpu_requests.labels(
-                        pod_name=k8s_pod_name,
-                        pod_namespace=k8s_pod_namespace,
-                        container_name=k8s_container_name,
-                        node_name=k8s_node_name,
-                    ).set(k8s_gpu_requests)
-
-                    self.process_nvidia_gpu_limits.labels(
-                        pod_name=k8s_pod_name,
-                        pod_namespace=k8s_pod_namespace,
-                        container_name=k8s_container_name,
-                        node_name=k8s_node_name,
-                    ).set(k8s_gpu_limits)
+                    # Pod-level metrics: only for processes that belong to a resolved pod
+                    if k8s_pod_name != 'N/A':
+                        pod_key = (k8s_pod_name, k8s_pod_namespace, k8s_container_name, k8s_node_name)
+                        current_pod_keys.add(pod_key)
+                        self.process_pod_labels.labels(*pod_key).info(
+                            _sanitize_pod_labels(k8s_pod_labels),
+                        )
+                        for gauge, value in (
+                            (self.process_nvidia_gpu_requests, k8s_gpu_requests),
+                            (self.process_nvidia_gpu_limits, k8s_gpu_limits),
+                        ):
+                            gauge.labels(*pod_key).set(
+                                float(value) if isinstance(value, (int, float)) else math.nan,
+                            )
 
         alive_pids.update(host_snapshots)
+        k8s_labels = self.process_k8s_labels[device]
         for pid, username in previous_alive_pids.difference(alive_pids):
-            # For dead processes, we need to try removing with various Kubernetes label combinations
-            # since we don't have the actual K8s info anymore
-            k8s_na_values = {
-                'pod_name': 'N/A',
-                'pod_namespace': 'N/A',
-                'pod_uid': 'N/A',
-                'container_name': 'N/A',
-                'container_id': 'N/A',
-                'node_name': 'N/A',
-            }
-
+            label_values = k8s_labels.pop((pid, username), ('N/A',) * 6)
             for collector in (
                 self.process_info,
                 self.process_running_time,
@@ -900,9 +928,6 @@ class PrometheusExporter:  # pylint: disable=too-many-instance-attributes
                 self.process_gpu_memory_utilization,
                 self.process_gpu_encoder_utilization,
                 self.process_gpu_decoder_utilization,
-                self.process_pod_labels,
-                self.process_nvidia_gpu_requests,
-                self.process_nvidia_gpu_limits,
             ):
                 try:
                     collector.remove(
@@ -912,12 +937,22 @@ class PrometheusExporter:  # pylint: disable=too-many-instance-attributes
                         uuid,
                         pid,
                         username,
-                        k8s_na_values['pod_name'],
-                        k8s_na_values['pod_namespace'],
-                        k8s_na_values['pod_uid'],
-                        k8s_na_values['container_name'],
-                        k8s_na_values['container_id'],
-                        k8s_na_values['node_name'],
+                        *label_values,
                     )
+                except KeyError:  # noqa: PERF203
+                    pass
+
+        # Remove pod-level series that no device reports anymore
+        previous_pod_keys = self.pod_label_keys[device]
+        self.pod_label_keys[device] = current_pod_keys
+        still_alive = set().union(*self.pod_label_keys.values())
+        for pod_key in previous_pod_keys - still_alive:
+            for collector in (
+                self.process_pod_labels,
+                self.process_nvidia_gpu_requests,
+                self.process_nvidia_gpu_limits,
+            ):
+                try:
+                    collector.remove(*pod_key)
                 except KeyError:  # noqa: PERF203
                     pass

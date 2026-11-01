@@ -365,16 +365,26 @@ spec:
         name: nvitop
     spec:
       serviceAccountName: nvitop
-      hostPID: true
+      hostPID: true            # required: NVML reports host PIDs, /proc/<pid>/cgroup must be visible
+      runtimeClassName: nvidia
       tolerations:
       - key: nvidia.com/gpu
         operator: Exists
         effect: NoSchedule
       containers:
-      - name: nvitop
-        image: nvitop:latest
-        command: ["sleep", "infinity"]
-  runtimeClassName: nvidia
+      - name: nvitop-exporter
+        image: nvitop-exporter:1.7.2-k8s
+        args: ["--bind-address", "0.0.0.0", "--port", "5050", "--interval", "5"]
+        env:
+        - name: NODE_NAME      # scopes the single pod list call to this node
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        # Optional tunables: NVITOP_K8S_ENABLED (1), NVITOP_K8S_POD_CACHE_TTL (30 s),
+        # NVITOP_K8S_REQUEST_TIMEOUT (3 s)
+        ports:
+        - containerPort: 5050
+          name: metrics
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -389,7 +399,7 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["pods"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

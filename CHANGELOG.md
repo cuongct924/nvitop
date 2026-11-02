@@ -17,11 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
--
+- Use percentage suffixes in TUI and Grafana column headers, such as `CPU%` and `GMBW%` rather than `%CPU` and `%GMBW`.
 
 ### Fixed
 
--
+- Reduce spurious zero CPU utilization readings in the process-metrics screen and treeview by [@arinawang11](https://github.com/arinawang11) in [#237](https://github.com/XuehaiPan/nvitop/pull/237).
 
 ### Removed
 
@@ -160,7 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Show `%GMBW` in main screen by [@XuehaiPan](https://github.com/XuehaiPan) in [#156](https://github.com/XuehaiPan/nvitop/pull/156).
+- Show `GMBW%` in main screen by [@XuehaiPan](https://github.com/XuehaiPan) in [#156](https://github.com/XuehaiPan/nvitop/pull/156).
 - Add doctests and add type annotations in `nvitop.tui` by [@XuehaiPan](https://github.com/XuehaiPan) in [#164](https://github.com/XuehaiPan/nvitop/pull/164).
 
 ### Changed

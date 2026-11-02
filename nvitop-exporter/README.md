@@ -81,6 +81,22 @@ scrape_configs:
 
 The exporter does not implement HTTP basic auth, OAuth, or IP allowlisting. Following the standard Prometheus exporter pattern, run the exporter behind a reverse proxy (`NGINX`, `Traefik`, `Caddy`, ...) if any of those are required.
 
+## Hardware Fault Metrics
+
+The exporter reads the following metrics from NVML for each physical GPU, with the labels `hostname`, `index`, `devicename` and `uuid`. MIG devices have none of them: their faults are reported on the parent GPU. A value that NVML cannot give (e.g. `NOT_SUPPORTED` on this card) has no series, so a missing series means "unknown", not zero.
+
+| Metric | NVML function | Meaning |
+| --- | --- | --- |
+| `gpu_xid_last_code` | `nvmlEventSetWait`, event `XidCriticalError` | Last XID code, 0 if none since the exporter started |
+| `gpu_xid_events_total` | as above | Number of XID events since the exporter started |
+| `gpu_ecc_volatile_corrected_total`, `gpu_ecc_volatile_uncorrected_total` | `nvmlDeviceGetTotalEccErrors` | Volatile ECC errors since the driver loaded |
+| `gpu_remapped_rows_correctable`, `gpu_remapped_rows_uncorrectable` | `nvmlDeviceGetRemappedRows` | Remapped memory rows |
+| `gpu_remapped_rows_pending`, `gpu_remapped_rows_failure` | as above | A remap waits for a GPU reset; a remap has failed (0 or 1) |
+| `gpu_pcie_replay_total` | `nvmlDeviceGetPcieReplayCounter` | PCIe replay counter |
+| `gpu_clock_event_reasons` | `nvmlDeviceGetCurrentClocksEventReasons` | Bitmask of clock event reasons: `0x4` software power cap, `0x8` hardware slowdown, `0x20` software thermal, `0x40` hardware thermal, `0x80` power brake |
+
+All of them are gauges holding the absolute value read from NVML, and the counters can go down when the driver reloads or the exporter restarts. An XID raised while the exporter is not running is lost.
+
 ## Grafana Dashboard
 
 A Grafana dashboard is provided to visualize the metrics collected by the exporter.

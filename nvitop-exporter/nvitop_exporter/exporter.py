@@ -26,6 +26,7 @@ from typing import Sequence
 from prometheus_client import REGISTRY, CollectorRegistry, Gauge, Info
 
 from nvitop import NA, Device, GpuProcess, MiB, MigDevice, PhysicalDevice, host
+from nvitop_exporter.nvml_faults import XidEventMonitor, read_faults
 from nvitop_exporter.utils import get_ip_address
 
 
@@ -670,9 +671,75 @@ class PrometheusExporter:  # pylint: disable=too-many-instance-attributes
             ],
             registry=self.registry,
         )
+        # Hardware faults. These names are a contract with metrics-hub: do not pass `unit` here, it
+        # would be appended to the metric name. Only physical GPUs that support them have series.
+        self.gpu_xid_last_code = Gauge(
+            name='gpu_xid_last_code',
+            documentation='Last XID critical error code of the GPU (0 if none since the exporter started).',
+            labelnames=['hostname', 'index', 'devicename', 'uuid'],
+            registry=self.registry,
+        )
+        self.gpu_xid_events_total = Gauge(
+            name='gpu_xid_events_total',
+            documentation='Number of XID critical errors of the GPU since the exporter started.',
+            labelnames=['hostname', 'index', 'devicename', 'uuid'],
+            registry=self.registry,
+        )
+        self.gpu_ecc_volatile_corrected_total = Gauge(
+            name='gpu_ecc_volatile_corrected_total',
+            documentation='Corrected volatile ECC errors of the GPU since the driver loaded.',
+            labelnames=['hostname', 'index', 'devicename', 'uuid'],
+            registry=self.registry,
+        )
+        self.gpu_ecc_volatile_uncorrected_total = Gauge(
+            name='gpu_ecc_volatile_uncorrected_total',
+            documentation='Uncorrected volatile ECC errors of the GPU since the driver loaded.',
+            labelnames=['hostname', 'index', 'devicename', 'uuid'],
+            registry=self.registry,
+        )
+        self.gpu_remapped_rows_correctable = Gauge(
+            name='gpu_remapped_rows_correctable',
+            documentation='GPU memory rows remapped due to correctable errors.',
+            labelnames=['hostname', 'index', 'devicename', 'uuid'],
+            registry=self.registry,
+        )
+        self.gpu_remapped_rows_uncorrectable = Gauge(
+            name='gpu_remapped_rows_uncorrectable',
+            documentation='GPU memory rows remapped due to uncorrectable errors.',
+            labelnames=['hostname', 'index', 'devicename', 'uuid'],
+            registry=self.registry,
+        )
+        self.gpu_remapped_rows_pending = Gauge(
+            name='gpu_remapped_rows_pending',
+            documentation='Whether remapped rows are pending a GPU reset (0 or 1).',
+            labelnames=['hostname', 'index', 'devicename', 'uuid'],
+            registry=self.registry,
+        )
+        self.gpu_remapped_rows_failure = Gauge(
+            name='gpu_remapped_rows_failure',
+            documentation='Whether a row remapping has failed (0 or 1).',
+            labelnames=['hostname', 'index', 'devicename', 'uuid'],
+            registry=self.registry,
+        )
+        self.gpu_pcie_replay_total = Gauge(
+            name='gpu_pcie_replay_total',
+            documentation='PCIe replay counter of the GPU.',
+            labelnames=['hostname', 'index', 'devicename', 'uuid'],
+            registry=self.registry,
+        )
+        self.gpu_clock_event_reasons = Gauge(
+            name='gpu_clock_event_reasons',
+            documentation='Bitmask of the current clock event reasons of the GPU.',
+            labelnames=['hostname', 'index', 'devicename', 'uuid'],
+            registry=self.registry,
+        )
+        self.xid_monitor = XidEventMonitor(
+            [device for device in self.devices if not device.is_mig_device()],
+        )
 
     def collect(self) -> None:
         """Collect metrics."""
+        self.xid_monitor.start()
         while True:
             next_update_time = time.monotonic() + self.interval
             self.update_host()
@@ -743,6 +810,9 @@ class PrometheusExporter:  # pylint: disable=too-many-instance-attributes
         )
         name = device.name()
         uuid = device.uuid()
+
+        if not device.is_mig_device():  # these faults only exist on the physical GPU
+            self._update_device_faults(device, (self.hostname, index, name, uuid))
 
         with device.oneshot():
             for gauge, value in (
@@ -832,6 +902,13 @@ class PrometheusExporter:  # pylint: disable=too-many-instance-attributes
                         k8s_container_id,
                         k8s_node_name,
                     ) = k8s_values
+                    # The labels of a live process can change (N/A -> pod name once the pod is
+                    # resolved, or PID reuse): drop the old series or it keeps its last value forever
+                    previous_k8s_values = self.process_k8s_labels[device].get((pid, username))
+                    if previous_k8s_values not in (None, k8s_values):
+                        self._remove_process_series(
+                            (index, name, uuid, pid, username, *previous_k8s_values),
+                        )
                     self.process_k8s_labels[device][pid, username] = k8s_values
 
                     self.process_info.labels(
@@ -917,30 +994,7 @@ class PrometheusExporter:  # pylint: disable=too-many-instance-attributes
         k8s_labels = self.process_k8s_labels[device]
         for pid, username in previous_alive_pids.difference(alive_pids):
             label_values = k8s_labels.pop((pid, username), ('N/A',) * 6)
-            for collector in (
-                self.process_info,
-                self.process_running_time,
-                self.process_cpu_percent,
-                self.process_rss_memory,
-                self.process_memory_percent,
-                self.process_gpu_memory,
-                self.process_gpu_sm_utilization,
-                self.process_gpu_memory_utilization,
-                self.process_gpu_encoder_utilization,
-                self.process_gpu_decoder_utilization,
-            ):
-                try:
-                    collector.remove(
-                        self.hostname,
-                        index,
-                        name,
-                        uuid,
-                        pid,
-                        username,
-                        *label_values,
-                    )
-                except KeyError:  # noqa: PERF203
-                    pass
+            self._remove_process_series((index, name, uuid, pid, username, *label_values))
 
         # Remove pod-level series that no device reports anymore
         previous_pod_keys = self.pod_label_keys[device]
@@ -956,3 +1010,46 @@ class PrometheusExporter:  # pylint: disable=too-many-instance-attributes
                     collector.remove(*pod_key)
                 except KeyError:  # noqa: PERF203
                     pass
+
+    def _remove_process_series(self, label_values: tuple[object, ...]) -> None:
+        """Remove the series of a process from every per-process metric."""
+        for collector in (
+            self.process_info,
+            self.process_running_time,
+            self.process_cpu_percent,
+            self.process_rss_memory,
+            self.process_memory_percent,
+            self.process_gpu_memory,
+            self.process_gpu_sm_utilization,
+            self.process_gpu_memory_utilization,
+            self.process_gpu_encoder_utilization,
+            self.process_gpu_decoder_utilization,
+        ):
+            try:
+                collector.remove(self.hostname, *label_values)
+            except KeyError:  # noqa: PERF203
+                pass
+
+    def _update_device_faults(self, device: Device, labels: tuple[str, str, str, str]) -> None:
+        """Update the hardware fault metrics. A value NVML cannot give has no series."""
+        faults = read_faults(device.handle)
+        xid_last_code, xid_events = self.xid_monitor.get(labels[3]) or (NA, NA)
+        for gauge, value in (
+            (self.gpu_xid_last_code, xid_last_code),
+            (self.gpu_xid_events_total, xid_events),
+            (self.gpu_ecc_volatile_corrected_total, faults['ecc_volatile_corrected']),
+            (self.gpu_ecc_volatile_uncorrected_total, faults['ecc_volatile_uncorrected']),
+            (self.gpu_remapped_rows_correctable, faults['remapped_rows_correctable']),
+            (self.gpu_remapped_rows_uncorrectable, faults['remapped_rows_uncorrectable']),
+            (self.gpu_remapped_rows_pending, faults['remapped_rows_pending']),
+            (self.gpu_remapped_rows_failure, faults['remapped_rows_failure']),
+            (self.gpu_pcie_replay_total, faults['pcie_replay']),
+            (self.gpu_clock_event_reasons, faults['clock_event_reasons']),
+        ):
+            if value is NA:  # missing is not zero: also drop a value exported earlier
+                try:
+                    gauge.remove(*labels)
+                except KeyError:
+                    pass
+            else:
+                gauge.labels(*labels).set(value)
